@@ -59,7 +59,8 @@ function corsHeaders(origin: string): Record<string, string> {
   return {
     'Access-Control-Allow-Origin': allowed,
     'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Cache-Control, Pragma, X-Requested-With',
+    'Access-Control-Max-Age': '86400',
     'Vary': 'Origin',
     'Content-Type': 'application/json',
   };
