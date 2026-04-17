@@ -16,16 +16,26 @@
 // Secrets (set via `npx wrangler secret put <NAME>`):
 //   SUPABASE_SERVICE_ROLE   — sb_secret_... (NEVER commit)
 //   TURNSTILE_SECRET        — Cloudflare Turnstile secret key (NEVER commit)
+//   DISCORD_CLIENT_ID       — Discord application Client ID (public, but kept in secrets for uniformity)
+//   DISCORD_CLIENT_SECRET   — Discord application Client Secret (NEVER commit)
 //
 // Public constants live inline — they'd be visible anyway via /api/config.
 
 interface Env {
   SUPABASE_SERVICE_ROLE: string;
   TURNSTILE_SECRET: string;
+  DISCORD_CLIENT_ID?: string;
+  DISCORD_CLIENT_SECRET?: string;
 }
 
 const SUPABASE_URL = 'https://nvnmoqghldbbhtycpjtx.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_kaP-pzvMjdUmwn681vovDg_D67UE9u_';
+
+// Discord OAuth config. The redirect URI here must match EXACTLY what's
+// registered in the Discord Developer Portal for this application.
+const DISCORD_REDIRECT_URI = 'https://vyla-api.laodebeqirize.workers.dev/api/discord?action=callback';
+const DISCORD_FRONTEND_URL = 'https://vyla.laodebeqirize.workers.dev';
+const DISCORD_SCOPES = 'identify';
 
 // Synthesized email domain — users sign in with just a username, we shape an
 // email behind the scenes because Supabase Auth is email-based.
@@ -143,6 +153,68 @@ function loginResponseFromSession(profile: any, session: any) {
     avatar_url: profile.avatar_url || null,
     session,
   };
+}
+
+// ─── Discord OAuth state helpers ────────────────────────────────────────────
+// State is a short-lived HMAC-signed token binding the Discord redirect
+// to a specific Supabase user id. Signing key = DISCORD_CLIENT_SECRET
+// (already opaque on the Worker, saves adding a separate secret).
+
+function b64urlEncode(bytes: Uint8Array): string {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlDecode(s: string): Uint8Array {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function hmacSign(payload: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+  return b64urlEncode(new Uint8Array(sig));
+}
+
+async function hmacVerify(payload: string, sig: string, secret: string): Promise<boolean> {
+  const expected = await hmacSign(payload, secret);
+  if (expected.length !== sig.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
+  return diff === 0;
+}
+
+async function signOAuthState(userId: string, secret: string): Promise<string> {
+  const payloadObj = { sub: userId, exp: Date.now() + 10 * 60 * 1000, nonce: crypto.randomUUID() };
+  const payload = b64urlEncode(new TextEncoder().encode(JSON.stringify(payloadObj)));
+  const sig = await hmacSign(payload, secret);
+  return `${payload}.${sig}`;
+}
+
+async function verifyOAuthState(state: string, secret: string): Promise<string | null> {
+  const parts = state.split('.');
+  if (parts.length !== 2) return null;
+  const [payload, sig] = parts;
+  if (!(await hmacVerify(payload, sig, secret))) return null;
+  try {
+    const decoded = JSON.parse(new TextDecoder().decode(b64urlDecode(payload)));
+    if (typeof decoded.sub !== 'string') return null;
+    if (typeof decoded.exp !== 'number' || decoded.exp < Date.now()) return null;
+    return decoded.sub;
+  } catch {
+    return null;
+  }
 }
 
 // Normalize incoming list items to storage shape (snake_case).
@@ -498,9 +570,210 @@ export default {
       }
     }
 
-    // ── /api/discord — stub (returns 401 so auth.js clears the token) ──
+    // ── /api/discord ───────────────────────────────────────────────────────
     if (pathname === '/api/discord') {
-      return json({ error: 'Discord integration not configured.' }, 401, headers);
+      const action = url.searchParams.get('action') || '';
+      try {
+        // Config guard — if the app isn't set up yet, return 401 on auth'd
+        // actions so auth.js clears the stale token, and an error redirect
+        // on the browser-facing callback.
+        const discordConfigured = !!(env.DISCORD_CLIENT_ID && env.DISCORD_CLIENT_SECRET);
+
+        // GET /api/discord?action=connect — auth'd, returns { redirectUrl }
+        if (action === 'connect' && request.method === 'GET') {
+          const authz = request.headers.get('authorization') || '';
+          const accessToken = authz.startsWith('Bearer ') ? authz.slice(7) : '';
+          if (!accessToken) return json({ message: 'Unauthorized.' }, 401, headers);
+          const authedUser = await getUserFromAccessToken(accessToken);
+          if (!authedUser) return json({ message: 'Invalid session.' }, 401, headers);
+
+          if (!discordConfigured) {
+            return json({ message: 'Discord integration not configured on server.' }, 503, headers);
+          }
+
+          const state = await signOAuthState(authedUser.id, env.DISCORD_CLIENT_SECRET!);
+          const params = new URLSearchParams({
+            client_id: env.DISCORD_CLIENT_ID!,
+            redirect_uri: DISCORD_REDIRECT_URI,
+            response_type: 'code',
+            scope: DISCORD_SCOPES,
+            state,
+            prompt: 'consent',
+          });
+          return json(
+            { redirectUrl: `https://discord.com/api/oauth2/authorize?${params.toString()}` },
+            200,
+            headers
+          );
+        }
+
+        // GET /api/discord?action=callback — Discord redirects here with ?code&state
+        if (action === 'callback' && request.method === 'GET') {
+          const redirectWithError = (reason: string) =>
+            Response.redirect(`${DISCORD_FRONTEND_URL}/?discord=error&reason=${encodeURIComponent(reason)}`, 302);
+
+          const code = url.searchParams.get('code');
+          const state = url.searchParams.get('state');
+          const errParam = url.searchParams.get('error');
+          if (errParam) return redirectWithError(errParam);
+          if (!code || !state) return redirectWithError('missing_params');
+          if (!discordConfigured) return redirectWithError('not_configured');
+
+          const userId = await verifyOAuthState(state, env.DISCORD_CLIENT_SECRET!);
+          if (!userId) return redirectWithError('bad_state');
+
+          // Exchange authorization code for access + refresh tokens
+          const tokenForm = new URLSearchParams();
+          tokenForm.append('client_id', env.DISCORD_CLIENT_ID!);
+          tokenForm.append('client_secret', env.DISCORD_CLIENT_SECRET!);
+          tokenForm.append('grant_type', 'authorization_code');
+          tokenForm.append('code', code);
+          tokenForm.append('redirect_uri', DISCORD_REDIRECT_URI);
+
+          const tokenResp = await fetch('https://discord.com/api/oauth2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: tokenForm.toString(),
+          });
+          if (!tokenResp.ok) {
+            const t = await tokenResp.text().catch(() => '');
+            console.error('[discord/callback] token exchange failed', tokenResp.status, t);
+            return redirectWithError('token_exchange_failed');
+          }
+          const tokenData = await tokenResp.json() as {
+            access_token: string;
+            refresh_token: string;
+            expires_in: number;
+          };
+
+          const profile = await getProfile(userId, env.SUPABASE_SERVICE_ROLE);
+          if (!profile) return redirectWithError('profile_missing');
+
+          const newSettings = {
+            ...(profile.settings || {}),
+            discord_access_token: tokenData.access_token,
+            discord_refresh_token: tokenData.refresh_token,
+            discord_token_expires: Date.now() + tokenData.expires_in * 1000,
+          };
+          const patchResp = await supaAdmin(
+            `/rest/v1/profiles?id=eq.${userId}`,
+            {
+              method: 'PATCH',
+              body: JSON.stringify({ settings: newSettings, updated_at: new Date().toISOString() }),
+            },
+            env.SUPABASE_SERVICE_ROLE
+          );
+          if (!patchResp.ok) return redirectWithError('save_failed');
+
+          return Response.redirect(`${DISCORD_FRONTEND_URL}/?discord=connected`, 302);
+        }
+
+        // GET /api/discord?action=get_user_profile — auth'd, proxies /users/@me
+        if (action === 'get_user_profile' && request.method === 'GET') {
+          const authz = request.headers.get('authorization') || '';
+          const accessToken = authz.startsWith('Bearer ') ? authz.slice(7) : '';
+          if (!accessToken) return json({ message: 'Unauthorized.' }, 401, headers);
+          const authedUser = await getUserFromAccessToken(accessToken);
+          if (!authedUser) return json({ message: 'Invalid session.' }, 401, headers);
+
+          const profile = await getProfile(authedUser.id, env.SUPABASE_SERVICE_ROLE);
+          if (!profile) return json({ message: 'Profile missing.' }, 500, headers);
+
+          let discordToken: string | undefined = profile.settings?.discord_access_token;
+          const discordRefresh: string | undefined = profile.settings?.discord_refresh_token;
+          const tokenExpires: number = profile.settings?.discord_token_expires || 0;
+
+          if (!discordToken) return json({ message: 'Discord not linked.' }, 401, headers);
+
+          // Proactively refresh if within 60s of expiry and we have a refresh token
+          if (
+            tokenExpires &&
+            Date.now() > tokenExpires - 60_000 &&
+            discordRefresh &&
+            discordConfigured
+          ) {
+            const refreshForm = new URLSearchParams();
+            refreshForm.append('client_id', env.DISCORD_CLIENT_ID!);
+            refreshForm.append('client_secret', env.DISCORD_CLIENT_SECRET!);
+            refreshForm.append('grant_type', 'refresh_token');
+            refreshForm.append('refresh_token', discordRefresh);
+
+            const refreshResp = await fetch('https://discord.com/api/oauth2/token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: refreshForm.toString(),
+            });
+            if (refreshResp.ok) {
+              const refreshed = await refreshResp.json() as {
+                access_token: string;
+                refresh_token: string;
+                expires_in: number;
+              };
+              discordToken = refreshed.access_token;
+              const newSettings = {
+                ...(profile.settings || {}),
+                discord_access_token: refreshed.access_token,
+                discord_refresh_token: refreshed.refresh_token,
+                discord_token_expires: Date.now() + refreshed.expires_in * 1000,
+              };
+              await supaAdmin(
+                `/rest/v1/profiles?id=eq.${authedUser.id}`,
+                {
+                  method: 'PATCH',
+                  body: JSON.stringify({ settings: newSettings, updated_at: new Date().toISOString() }),
+                },
+                env.SUPABASE_SERVICE_ROLE
+              ).catch(() => {});
+            } else {
+              // Refresh failed — surface 401 so frontend clears the stale token
+              return json({ message: 'Discord session expired.' }, 401, headers);
+            }
+          }
+
+          const meResp = await fetch('https://discord.com/api/users/@me', {
+            headers: { 'Authorization': `Bearer ${discordToken}` },
+          });
+          if (meResp.status === 401) return json({ message: 'Discord token invalid.' }, 401, headers);
+          if (!meResp.ok) return json({ message: 'Failed to fetch Discord user.' }, 502, headers);
+          const discordUser = await meResp.json();
+          return json(discordUser, 200, headers);
+        }
+
+        // POST /api/discord?action=revoke — frontend passes { token }
+        if (action === 'revoke' && request.method === 'POST') {
+          const body = await request.json().catch(() => ({})) as { token?: string };
+          const token = body.token;
+          if (token && discordConfigured) {
+            const form = new URLSearchParams();
+            form.append('client_id', env.DISCORD_CLIENT_ID!);
+            form.append('client_secret', env.DISCORD_CLIENT_SECRET!);
+            form.append('token', token);
+            await fetch('https://discord.com/api/oauth2/token/revoke', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: form.toString(),
+            }).catch(() => {});
+          }
+          return json({ ok: true }, 200, headers);
+        }
+
+        // POST /api/discord?action=update_presence — Discord REST cannot set
+        // user Rich Presence (that requires the Gateway WebSocket, which
+        // Workers cannot hold open). Stubbed to 200 so the frontend's
+        // fire-and-forget sync call doesn't error.
+        if (action === 'update_presence') {
+          return json({ ok: true, note: 'presence_not_supported_via_rest' }, 200, headers);
+        }
+
+        return json(
+          { message: `Unsupported ${request.method} /api/discord?action=${action}` },
+          405,
+          headers
+        );
+      } catch (e: any) {
+        console.error('[/api/discord] error:', e);
+        return json({ message: e.message || 'Internal error.' }, 500, headers);
+      }
     }
 
     return json({ error: 'Not found' }, 404, headers);
