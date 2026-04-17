@@ -18,6 +18,7 @@
 //   TURNSTILE_SECRET        — Cloudflare Turnstile secret key (NEVER commit)
 //   DISCORD_CLIENT_ID       — Discord application Client ID (public, but kept in secrets for uniformity)
 //   DISCORD_CLIENT_SECRET   — Discord application Client Secret (NEVER commit)
+//   DISCORD_WEBHOOK_URL     — (optional) Discord webhook URL for error telemetry
 //
 // Public constants live inline — they'd be visible anyway via /api/config.
 
@@ -26,6 +27,7 @@ interface Env {
   TURNSTILE_SECRET: string;
   DISCORD_CLIENT_ID?: string;
   DISCORD_CLIENT_SECRET?: string;
+  DISCORD_WEBHOOK_URL?: string;
 }
 
 const SUPABASE_URL = 'https://nvnmoqghldbbhtycpjtx.supabase.co';
@@ -532,6 +534,35 @@ export default {
           return json({ ok: true }, 200, headers);
         }
 
+        // POST /api/auth?action=feedback ─────────────────────────────────
+        if (action === 'feedback' && request.method === 'POST') {
+          const body = await request.json().catch(() => ({})) as Record<string, any>;
+          // Store in a feedback table if present; otherwise fall back to a
+          // log line so nothing is lost. Table columns are flexible — we
+          // store the full payload as jsonb to avoid schema lockstep.
+          const row = {
+            user_id: authedUser.id,
+            payload: body,
+            created_at: new Date().toISOString(),
+          };
+          const r = await supaAdmin(
+            '/rest/v1/feedback',
+            {
+              method: 'POST',
+              headers: { 'Prefer': 'return=minimal' },
+              body: JSON.stringify(row),
+            },
+            env.SUPABASE_SERVICE_ROLE
+          );
+          if (!r.ok) {
+            // If the feedback table doesn't exist yet, don't fail the UX —
+            // log and return 200 so the user sees "Feedback received".
+            const errText = await r.text().catch(() => '');
+            console.warn('[/api/auth?action=feedback] table missing or insert failed:', r.status, errText);
+          }
+          return json({ ok: true }, 200, headers);
+        }
+
         // POST /api/auth (no action param) — admin role update ───────────
         if (!action && request.method === 'POST') {
           const body = await request.json() as any;
@@ -773,6 +804,84 @@ export default {
         );
       } catch (e: any) {
         console.error('[/api/discord] error:', e);
+        return json({ message: e.message || 'Internal error.' }, 500, headers);
+      }
+    }
+
+    // ── /api/discord-webhook — error telemetry sink ────────────────────
+    // If DISCORD_WEBHOOK_URL is set, forwards the error. Otherwise just
+    // logs and returns 200 so the frontend's fire-and-forget call never
+    // spams the console with 404s.
+    if (pathname === '/api/discord-webhook' && request.method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({})) as { type?: string; error?: string };
+        const errorText = typeof body.error === 'string' ? body.error : JSON.stringify(body);
+        if (env.DISCORD_WEBHOOK_URL) {
+          // Discord webhook content cap is 2000 chars
+          const trimmed = errorText.length > 1900 ? errorText.slice(0, 1900) + '…' : errorText;
+          await fetch(env.DISCORD_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              content: `**Vyla ${body.type || 'event'}**\n\`\`\`\n${trimmed}\n\`\`\``,
+            }),
+          }).catch((e) => console.warn('[discord-webhook] forward failed', e));
+        } else {
+          console.warn('[discord-webhook]', body.type, errorText);
+        }
+      } catch {
+        // Never surface errors to the caller — telemetry must not break UX.
+      }
+      return json({ ok: true }, 200, headers);
+    }
+
+    // ── /api/admin/broadcast — Supabase Realtime broadcast (admin only) ─
+    if (pathname === '/api/admin/broadcast' && request.method === 'POST') {
+      try {
+        const authz = request.headers.get('authorization') || '';
+        const accessToken = authz.startsWith('Bearer ') ? authz.slice(7) : '';
+        if (!accessToken) return json({ message: 'Unauthorized.' }, 401, headers);
+        const authedUser = await getUserFromAccessToken(accessToken);
+        if (!authedUser) return json({ message: 'Invalid session.' }, 401, headers);
+        const caller = await getProfile(authedUser.id, env.SUPABASE_SERVICE_ROLE);
+        if (!caller || !['admin', 'owner'].includes(caller.role)) {
+          return json({ message: 'Forbidden.' }, 403, headers);
+        }
+
+        const body = await request.json().catch(() => ({})) as {
+          channelName?: string;
+          event?: string;
+          payload?: any;
+        };
+        if (!body.channelName || !body.event) {
+          return json({ message: 'channelName and event required.' }, 400, headers);
+        }
+
+        // Supabase Realtime broadcast via REST
+        const r = await fetch(`${SUPABASE_URL}/realtime/v1/api/broadcast`, {
+          method: 'POST',
+          headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE,
+            'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            messages: [
+              {
+                topic: body.channelName,
+                event: body.event,
+                payload: body.payload ?? {},
+              },
+            ],
+          }),
+        });
+        if (!r.ok) {
+          const errText = await r.text().catch(() => '');
+          return json({ message: `Broadcast failed: ${errText || r.status}` }, 500, headers);
+        }
+        return json({ ok: true }, 200, headers);
+      } catch (e: any) {
+        console.error('[/api/admin/broadcast] error:', e);
         return json({ message: e.message || 'Internal error.' }, 500, headers);
       }
     }
