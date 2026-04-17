@@ -35,7 +35,7 @@ const SUPABASE_ANON_KEY = 'sb_publishable_kaP-pzvMjdUmwn681vovDg_D67UE9u_';
 // registered in the Discord Developer Portal for this application.
 const DISCORD_REDIRECT_URI = 'https://vyla-api.laodebeqirize.workers.dev/api/discord?action=callback';
 const DISCORD_FRONTEND_URL = 'https://vyla.laodebeqirize.workers.dev';
-const DISCORD_SCOPES = 'identify';
+const DISCORD_SCOPES = 'identify email';
 
 // Synthesized email domain — users sign in with just a username, we shape an
 // email behind the scenes because Supabase Auth is email-based.
