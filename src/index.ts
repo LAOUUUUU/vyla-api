@@ -158,6 +158,26 @@ function loginResponseFromSession(profile: any, session: any) {
   };
 }
 
+// Supabase Auth's /auth/v1/admin/users ban_duration accepts a Go duration
+// string (e.g. "24h", "168h", "876000h" for ~100 years). The admin UI sends
+// human inputs like "7d", "30m", "2h", or null/"" for "permanent".
+function normalizeBanDuration(input: string | null | undefined): string {
+  if (!input) return '876000h'; // ~100 years ≈ permanent
+  const trimmed = String(input).trim().toLowerCase();
+  // Already in Go-ish format (Ns/Nm/Nh)
+  if (/^\d+(\.\d+)?(h|m|s)$/.test(trimmed)) return trimmed;
+  // Days → hours
+  const dayMatch = trimmed.match(/^(\d+(\.\d+)?)d$/);
+  if (dayMatch) return `${Math.max(1, Math.round(parseFloat(dayMatch[1]) * 24))}h`;
+  // Weeks → hours
+  const weekMatch = trimmed.match(/^(\d+(\.\d+)?)w$/);
+  if (weekMatch) return `${Math.max(1, Math.round(parseFloat(weekMatch[1]) * 168))}h`;
+  // Bare number → treat as hours
+  if (/^\d+(\.\d+)?$/.test(trimmed)) return `${trimmed}h`;
+  // Fallback to permanent if we can't parse
+  return '876000h';
+}
+
 // ─── Discord OAuth state helpers ────────────────────────────────────────────
 // State is a short-lived HMAC-signed token binding the Discord redirect
 // to a specific Supabase user id. Signing key = DISCORD_CLIENT_SECRET
@@ -563,19 +583,22 @@ export default {
           return json({ ok: true }, 200, headers);
         }
 
-        // POST /api/auth (no action param) — admin role update ───────────
+        // POST /api/auth (no action param) — admin dispatch ─────────────
         if (!action && request.method === 'POST') {
           const body = await request.json() as any;
+
+          // All actions below require admin or owner. Fetch caller once.
+          const caller = await getProfile(authedUser.id, env.SUPABASE_SERVICE_ROLE);
+          if (!caller || !['admin', 'owner'].includes(caller.role)) {
+            return json({ message: 'Forbidden.' }, 403, headers);
+          }
+
+          // ── update_role ─────────────────────────────────────────────
           if (body.action === 'update_role') {
-            const caller = await getProfile(authedUser.id, env.SUPABASE_SERVICE_ROLE);
-            if (!caller || !['admin', 'owner'].includes(caller.role)) {
-              return json({ message: 'Forbidden.' }, 403, headers);
-            }
             const { targetUserId, newRole } = body;
             if (!['user', 'admin', 'owner'].includes(newRole)) {
               return json({ message: 'Invalid role.' }, 400, headers);
             }
-            // Only owners can grant/revoke owner
             if (newRole === 'owner' && caller.role !== 'owner') {
               return json({ message: 'Only owners can assign owner role.' }, 403, headers);
             }
@@ -587,11 +610,311 @@ export default {
               },
               env.SUPABASE_SERVICE_ROLE
             );
-            if (!r.ok) {
-              return json({ message: 'Failed to update role.' }, 500, headers);
-            }
+            if (!r.ok) return json({ message: 'Failed to update role.' }, 500, headers);
             return json({ message: `Role updated to ${newRole}.` }, 200, headers);
           }
+
+          // ── admin_update_site_config ────────────────────────────────
+          // Stored in public.site_config as a single row (id=1) with a
+          // jsonb `config` column, merged per key.
+          if (body.action === 'admin_update_site_config') {
+            const { key, value } = body;
+            if (typeof key !== 'string' || !key) {
+              return json({ message: 'key required.' }, 400, headers);
+            }
+            // Read current
+            const cur = await supaAdmin(
+              `/rest/v1/site_config?id=eq.1&select=config`,
+              { method: 'GET' },
+              env.SUPABASE_SERVICE_ROLE
+            );
+            let currentConfig: Record<string, any> = {};
+            if (cur.ok) {
+              const rows = await cur.json() as any[];
+              if (rows[0]?.config && typeof rows[0].config === 'object') {
+                currentConfig = rows[0].config;
+              }
+            }
+            currentConfig[key] = value;
+            // Upsert row id=1
+            const up = await supaAdmin(
+              `/rest/v1/site_config`,
+              {
+                method: 'POST',
+                headers: {
+                  'Prefer': 'resolution=merge-duplicates,return=minimal',
+                },
+                body: JSON.stringify({ id: 1, config: currentConfig, updated_at: new Date().toISOString() }),
+              },
+              env.SUPABASE_SERVICE_ROLE
+            );
+            if (!up.ok) {
+              const errText = await up.text().catch(() => '');
+              return json({ message: `Failed to save config: ${errText}` }, 500, headers);
+            }
+            return json({ ok: true, message: 'Config updated.' }, 200, headers);
+          }
+
+          // ── admin_user_management ───────────────────────────────────
+          if (body.action === 'admin_user_management') {
+            const sub = body.subAction;
+
+            // find_user — single match by username (case-insensitive exact)
+            if (sub === 'find_user') {
+              const q: string = String(body.query || '').toLowerCase().trim();
+              if (!q) return json({ message: 'query required.' }, 400, headers);
+              const r = await supaAdmin(
+                `/rest/v1/profiles?username=eq.${encodeURIComponent(q)}&select=id,username,role,avatar_url`,
+                { method: 'GET' },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              const rows = r.ok ? await r.json() as any[] : [];
+              if (rows.length === 0) return json({ message: 'Not found.' }, 404, headers);
+              return json(rows[0], 200, headers);
+            }
+
+            // find_users_by_username — partial match (ILIKE)
+            if (sub === 'find_users_by_username') {
+              const q: string = String(body.query || '').toLowerCase().trim();
+              if (!q) return json({ message: 'query required.' }, 400, headers);
+              const r = await supaAdmin(
+                `/rest/v1/profiles?username=ilike.*${encodeURIComponent(q)}*&select=id,username,role,avatar_url&order=username.asc&limit=50`,
+                { method: 'GET' },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              const rows = r.ok ? await r.json() as any[] : [];
+              if (rows.length === 0) return json([], 404, headers);
+              return json(rows, 200, headers);
+            }
+
+            // get_all_users — paginated (50 per page)
+            if (sub === 'get_all_users') {
+              const page = Math.max(1, parseInt(body.page, 10) || 1);
+              const limit = 50;
+              const offset = (page - 1) * limit;
+              const r = await supaAdmin(
+                `/rest/v1/profiles?select=id,username,role,avatar_url,created_at&order=created_at.desc&limit=${limit}&offset=${offset}`,
+                { method: 'GET', headers: { 'Prefer': 'count=exact' } },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              if (!r.ok) return json({ message: 'Failed to fetch users.' }, 500, headers);
+              const users = await r.json() as any[];
+              const contentRange = r.headers.get('content-range') || '';
+              const count = parseInt(contentRange.split('/')[1], 10) || users.length;
+              return json({ users, count }, 200, headers);
+            }
+
+            // inspect — profile + auth details + favorites + watchLater + recentHistory
+            if (sub === 'inspect') {
+              const targetId: string = body.targetUserId;
+              if (!targetId) return json({ message: 'targetUserId required.' }, 400, headers);
+
+              const [profileResp, authResp] = await Promise.all([
+                supaAdmin(
+                  `/rest/v1/profiles?id=eq.${targetId}&select=*`,
+                  { method: 'GET' },
+                  env.SUPABASE_SERVICE_ROLE
+                ),
+                supaAdmin(
+                  `/auth/v1/admin/users/${targetId}`,
+                  { method: 'GET' },
+                  env.SUPABASE_SERVICE_ROLE
+                ),
+              ]);
+              const profileRows = profileResp.ok ? await profileResp.json() as any[] : [];
+              if (profileRows.length === 0) return json({ message: 'User not found.' }, 404, headers);
+              const profile = profileRows[0];
+              const authDetails = authResp.ok ? await authResp.json() : {};
+
+              // Convert watch_progress {key: {title, last_updated_at, ...}} → sorted array
+              const wp = profile.watch_progress || {};
+              const recentHistory = Object.values(wp)
+                .filter((h: any) => h && typeof h === 'object')
+                .sort((a: any, b: any) => {
+                  const ta = new Date(a.last_updated_at || 0).getTime();
+                  const tb = new Date(b.last_updated_at || 0).getTime();
+                  return tb - ta;
+                })
+                .slice(0, 20);
+
+              return json({
+                profile: {
+                  id: profile.id,
+                  username: profile.username,
+                  email: authDetails.email || null,
+                  role: profile.role,
+                  visit_count: profile.settings?.visit_count || 0,
+                },
+                authDetails: {
+                  created_at: authDetails.created_at || null,
+                  last_sign_in_at: authDetails.last_sign_in_at || null,
+                },
+                favorites: profile.favorites || [],
+                watchLater: profile.watch_later || [],
+                recentHistory,
+              }, 200, headers);
+            }
+
+            // delete_user — remove auth user (profile cascades)
+            if (sub === 'delete_user') {
+              const targetId: string = body.targetUserId;
+              if (!targetId) return json({ message: 'targetUserId required.' }, 400, headers);
+              if (targetId === authedUser.id) {
+                return json({ message: 'Refusing to delete your own account.' }, 400, headers);
+              }
+              const r = await supaAdmin(
+                `/auth/v1/admin/users/${targetId}`,
+                { method: 'DELETE' },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              if (!r.ok) {
+                const t = await r.text().catch(() => '');
+                return json({ message: `Delete failed: ${t}` }, 500, headers);
+              }
+              return json({ message: 'User deleted.' }, 200, headers);
+            }
+
+            // ban_user — duration like "7d", "24h", "30m". null/empty = permanent.
+            if (sub === 'ban_user') {
+              const targetId: string = body.targetUserId;
+              if (!targetId) return json({ message: 'targetUserId required.' }, 400, headers);
+              const duration: string | null = body.duration || null;
+              const banDuration = normalizeBanDuration(duration);
+              const r = await supaAdmin(
+                `/auth/v1/admin/users/${targetId}`,
+                {
+                  method: 'PUT',
+                  body: JSON.stringify({ ban_duration: banDuration }),
+                },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              if (!r.ok) {
+                const t = await r.text().catch(() => '');
+                return json({ message: `Ban failed: ${t}` }, 500, headers);
+              }
+              return json({ message: duration ? `User banned for ${duration}.` : 'User banned permanently.' }, 200, headers);
+            }
+
+            // unban_user — lifts ban (ban_duration=none)
+            if (sub === 'unban_user') {
+              const targetId: string = body.targetUserId;
+              if (!targetId) return json({ message: 'targetUserId required.' }, 400, headers);
+              const r = await supaAdmin(
+                `/auth/v1/admin/users/${targetId}`,
+                {
+                  method: 'PUT',
+                  body: JSON.stringify({ ban_duration: 'none' }),
+                },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              if (!r.ok) {
+                const t = await r.text().catch(() => '');
+                return json({ message: `Unban failed: ${t}` }, 500, headers);
+              }
+              return json({ message: 'User unbanned.' }, 200, headers);
+            }
+
+            // reset_password — generate a recovery link (admin copies it)
+            if (sub === 'reset_password') {
+              const targetId: string = body.targetUserId;
+              if (!targetId) return json({ message: 'targetUserId required.' }, 400, headers);
+              const ar = await supaAdmin(
+                `/auth/v1/admin/users/${targetId}`,
+                { method: 'GET' },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              if (!ar.ok) return json({ message: 'User not found.' }, 404, headers);
+              const authUser = await ar.json() as any;
+              const email = authUser?.email;
+              if (!email) return json({ message: 'Target has no email.' }, 400, headers);
+
+              const linkResp = await supaAdmin(
+                `/auth/v1/admin/generate_link`,
+                {
+                  method: 'POST',
+                  body: JSON.stringify({ type: 'recovery', email }),
+                },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              if (!linkResp.ok) {
+                const t = await linkResp.text().catch(() => '');
+                return json({ message: `Link generation failed: ${t}` }, 500, headers);
+              }
+              const linkData = await linkResp.json() as any;
+              const link = linkData.action_link || linkData.properties?.action_link || null;
+              if (!link) return json({ message: 'No link returned.' }, 500, headers);
+              return json({ link, message: 'Reset link generated.' }, 200, headers);
+            }
+
+            // get_active_users — top N by (fav*2 + wl*2 + history)
+            if (sub === 'get_active_users') {
+              const limit = Math.min(50, Math.max(1, parseInt(body.limit, 10) || 10));
+              const r = await supaAdmin(
+                `/rest/v1/profiles?select=username,favorites,watch_later,watch_progress&limit=500`,
+                { method: 'GET' },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              if (!r.ok) return json({ message: 'Failed to fetch users.' }, 500, headers);
+              const rows = await r.json() as any[];
+              const scored = rows.map((p) => {
+                const favs = Array.isArray(p.favorites) ? p.favorites.length : 0;
+                const wl = Array.isArray(p.watch_later) ? p.watch_later.length : 0;
+                const hist = p.watch_progress && typeof p.watch_progress === 'object'
+                  ? Object.keys(p.watch_progress).length
+                  : 0;
+                return {
+                  username: p.username,
+                  history_count: hist,
+                  favorites_count: favs,
+                  watch_later_count: wl,
+                  activity_score: favs * 2 + wl * 2 + hist,
+                };
+              });
+              scored.sort((a, b) => b.activity_score - a.activity_score);
+              return json(scored.slice(0, limit), 200, headers);
+            }
+
+            // purge_history / purge_favorites / purge_watch_later
+            if (sub === 'purge_history' || sub === 'purge_favorites' || sub === 'purge_watch_later') {
+              const targetId: string = body.targetUserId;
+              if (!targetId) return json({ message: 'targetUserId required.' }, 400, headers);
+              const patch: Record<string, any> = { updated_at: new Date().toISOString() };
+              if (sub === 'purge_history') patch.watch_progress = {};
+              if (sub === 'purge_favorites') patch.favorites = [];
+              if (sub === 'purge_watch_later') patch.watch_later = [];
+              const r = await supaAdmin(
+                `/rest/v1/profiles?id=eq.${targetId}`,
+                { method: 'PATCH', body: JSON.stringify(patch) },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              if (!r.ok) return json({ message: 'Purge failed.' }, 500, headers);
+              const humanLabel = sub === 'purge_history' ? 'history' : sub === 'purge_favorites' ? 'favorites' : 'watch later';
+              return json({ message: `Cleared ${humanLabel}.` }, 200, headers);
+            }
+
+            // impersonate — NOT implemented (security-sensitive)
+            if (sub === 'impersonate') {
+              return json({ message: 'Impersonation is not supported on this deployment.' }, 501, headers);
+            }
+
+            // export_database — owner-only full dump (profiles only, keep it bounded)
+            if (sub === 'export_database') {
+              if (caller.role !== 'owner') {
+                return json({ message: 'Only owners can export the database.' }, 403, headers);
+              }
+              const r = await supaAdmin(
+                `/rest/v1/profiles?select=*&limit=10000`,
+                { method: 'GET' },
+                env.SUPABASE_SERVICE_ROLE
+              );
+              if (!r.ok) return json({ message: 'Export failed.' }, 500, headers);
+              const profiles = await r.json();
+              return json({ exported_at: new Date().toISOString(), profiles }, 200, headers);
+            }
+
+            return json({ message: `Unknown admin subAction: ${sub}` }, 400, headers);
+          }
+
           return json({ message: 'Unknown action.' }, 400, headers);
         }
 
