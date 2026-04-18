@@ -19,6 +19,10 @@
 //   DISCORD_CLIENT_ID       — Discord application Client ID (public, but kept in secrets for uniformity)
 //   DISCORD_CLIENT_SECRET   — Discord application Client Secret (NEVER commit)
 //   DISCORD_WEBHOOK_URL     — (optional) Discord webhook URL for error telemetry
+//   DOWNLOAD_UPSTREAM_URL   — (optional) Base URL of an upstream source resolver
+//                             that implements GET /api/download/{movie,tv}?id=...
+//                             If unset, /api/download returns an empty source list
+//                             so the UI shows "no downloads available" cleanly.
 //
 // Public constants live inline — they'd be visible anyway via /api/config.
 
@@ -28,6 +32,7 @@ interface Env {
   DISCORD_CLIENT_ID?: string;
   DISCORD_CLIENT_SECRET?: string;
   DISCORD_WEBHOOK_URL?: string;
+  DOWNLOAD_UPSTREAM_URL?: string;
 }
 
 const SUPABASE_URL = 'https://nvnmoqghldbbhtycpjtx.supabase.co';
@@ -306,6 +311,51 @@ export default {
       const id = url.searchParams.get('id');
       if (!id) return json({ error: 'Missing video ID' }, 400, headers);
       return json({ title: 'Trailer', uploader: 'YouTube' }, 200, headers);
+    }
+
+    // ── /api/download/{movie,tv} ───────────────────────────────────────────
+    // Frontend contract (js/index.js fetchSources / fetchDownloadable):
+    //   GET /api/download/movie?id=<tmdb_id>
+    //   GET /api/download/tv?id=<tmdb_id>&season=<n>&episode=<n>
+    //   → { success: true, sources: [{ is_hls: bool, download_url: string, ... }] }
+    //
+    // This fork doesn't ship its own source scraper. If DOWNLOAD_UPSTREAM_URL
+    // is configured we proxy through (preserving the full query string and
+    // method); otherwise we return a well-formed empty payload so the UI
+    // shows "No direct download links available" instead of crashing.
+    if (pathname === '/api/download/movie' || pathname === '/api/download/tv') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return json({ error: 'Method not allowed' }, 405, headers);
+      }
+      const upstream = (env.DOWNLOAD_UPSTREAM_URL || '').replace(/\/+$/, '');
+      if (!upstream) {
+        // No resolver wired up — respond with empty sources so the frontend
+        // retry loop exits cleanly rather than spinning on errors.
+        return json({ success: true, sources: [] }, 200, headers);
+      }
+      try {
+        const target = `${upstream}${pathname}${url.search}`;
+        const r = await fetch(target, {
+          method: 'GET',
+          headers: { 'accept': 'application/json' },
+          // Cloudflare Workers cache: download manifests are cheap to re-scrape
+          // but expensive to discover, so a short edge cache is worth it.
+          cf: { cacheTtl: 300, cacheEverything: true } as any,
+        });
+        const body = await r.text();
+        // Pass through status + JSON body, but re-stamp CORS headers so the
+        // browser accepts the response from our origin.
+        return new Response(body, {
+          status: r.status,
+          headers: {
+            ...headers,
+            'content-type': r.headers.get('content-type') || 'application/json',
+          },
+        });
+      } catch (e: any) {
+        console.warn('[/api/download] upstream proxy failed:', e?.message || e);
+        return json({ success: true, sources: [] }, 200, headers);
+      }
     }
 
     // ── /api/auth ──────────────────────────────────────────────────────────
