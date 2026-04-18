@@ -41,7 +41,10 @@ const SUPABASE_ANON_KEY = 'sb_publishable_kaP-pzvMjdUmwn681vovDg_D67UE9u_';
 // Discord OAuth config. The redirect URI here must match EXACTLY what's
 // registered in the Discord Developer Portal for this application.
 const DISCORD_REDIRECT_URI = 'https://vyla-api.laodebeqirize.workers.dev/api/discord?action=callback';
-const DISCORD_FRONTEND_URL = 'https://vyla.laodebeqirize.workers.dev';
+// Primary site URL after Discord OAuth callback completes. vyra.laouuu.win is
+// the canonical fork domain; vyla.laodebeqirize.workers.dev is kept as a
+// reachable alias but is no longer the user-facing URL.
+const DISCORD_FRONTEND_URL = 'https://vyra.laouuu.win';
 const DISCORD_SCOPES = 'identify email';
 
 // Synthesized email domain — users sign in with just a username, we shape an
@@ -49,8 +52,9 @@ const DISCORD_SCOPES = 'identify email';
 const EMAIL_DOMAIN = 'vyla.local';
 
 const ALLOWED_ORIGINS = [
-  'https://vyla.pages.dev',
-  'https://vyla.laodebeqirize.workers.dev',
+  'https://vyra.laouuu.win',                   // canonical fork domain
+  'https://vyla.laodebeqirize.workers.dev',    // Workers.dev alias (kept reachable)
+  'https://vyla.pages.dev',                    // upstream Pages deployment
   'http://localhost:8000',
   'http://localhost:3000',
   'http://127.0.0.1:8000',
