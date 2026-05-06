@@ -54,7 +54,7 @@ const EMAIL_DOMAIN = 'vyla.local';
 const ALLOWED_ORIGINS = [
   'https://vyra.laouuu.win',                   // canonical fork domain
   'https://vyla.laodebeqirize.workers.dev',    // Workers.dev alias (kept reachable)
-  'https://vyla.pages.dev',                    // upstream Pages deployment
+  'https://vyla-api-v2.pages.dev',                    // upstream Pages deployment
   'http://localhost:8000',
   'http://localhost:3000',
   'http://127.0.0.1:8000',
